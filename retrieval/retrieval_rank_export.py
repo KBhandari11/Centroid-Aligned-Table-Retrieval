@@ -174,9 +174,9 @@ if __name__ == "__main__":
     dataset_list = ["WTQ", "WIKISQL","NQ"]  # matches your current retrieval() setup
 
     questions_path = "./data/dataset_all/new_all_questions_dict_wtq_nqt_wikisql.pkl"
-    tables_path = "./dataset_all/all_table_transform_table_corpus.pkl"
+    tables_path = "./data/dataset_all/all_table_transform_table_corpus.pkl"
 
-    output_root = f"./retrieval_all/{model_name}_results_rank"
+    output_root = f"./data/retrieval_all/{model_name}_results_rank"
     os.makedirs(output_root, exist_ok=True)
 
 

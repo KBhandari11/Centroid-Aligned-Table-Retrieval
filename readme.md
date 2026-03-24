@@ -54,12 +54,10 @@ The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, e
 Python 3.10 or later is recommended.
 
 ```bash
-git clone <repo-url>
-cd table-representation-retrieval
+git clone https://github.com/KBhandari11/Centroid-Aligned-Table-Retrieval.git
+cd Centroid-Aligned-Table-Retrieval
 pip install -r requirements.txt
 ```
-
-For CUDA machines, replace `faiss-cpu` with `faiss-gpu` in `requirements.txt` before installing.
 
 ---
 
@@ -97,10 +95,10 @@ All retrieval scripts take the model name as the first positional argument. Resu
 **Single-format retrieval across all 17 serializations and 5 centroid variants:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6 python -m retrieval.retrieval_all_multiple_dataset reasonir
-CUDA_VISIBLE_DEVICES=2   python -m retrieval.retrieval_all_multiple_dataset bge
-CUDA_VISIBLE_DEVICES=3   python -m retrieval.retrieval_all_multiple_dataset mpnet
-CUDA_VISIBLE_DEVICES=4   python -m retrieval.retrieval_all_multiple_dataset splade
+CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset reasonir
+CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset bge
+CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset mpnet
+CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset splade
 ```
 
 **Custom centroid combination** (any subset of the 17 base representations):
@@ -117,13 +115,13 @@ Results for each combination are appended into the same `perturbation_results.js
 **Per-question gold rank export** (used by the analysis notebooks):
 
 ```bash
-CUDA_VISIBLE_DEVICES=5,6 python -m retrieval.retrieval_rank_export reasonir
-CUDA_VISIBLE_DEVICES=2   python -m retrieval.retrieval_rank_export bge
-CUDA_VISIBLE_DEVICES=3   python -m retrieval.retrieval_rank_export mpnet
-CUDA_VISIBLE_DEVICES=4   python -m retrieval.retrieval_rank_export splade
+CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_rank_export reasonir
+CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export bge
+CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export mpnet
+CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export splade
 ```
 
-Per-representation CSV files land in `./retrieval_all/{model_name}_results_rank/{dataset}/{rep}_gold_rank_per_question.csv`.
+Per-representation CSV files land in `./data/retrieval_all/{model_name}_results_rank/{dataset}/{rep}_gold_rank_per_question.csv`.
 
 ---
 
@@ -261,3 +259,10 @@ These are the defaults set directly in `train_universal_adapter.py` via `TrainCf
 | Residual scale (α) | 0.01 |
 | Log / checkpoint every | 200 steps |
 
+---
+
+## Citation
+
+
+```
+```
