@@ -63,7 +63,7 @@ pip install -r requirements.txt
 
 ## 2. Data Setup
 
-The pipeline expects two pre-built pickle files under `data/dataset_all/`. These are derived from WTQ, WikiSQL, and NQ-Tables and contain the questions dict and the serialized table corpus across all 17 formats. Link to download the data will be provided after paper acceptance to avoid violating conference anonymity.
+The pipeline expects two pre-built pickle files under `data/dataset_all/`. These are derived from WTQ, WikiSQL, and NQ-Tables and contain the questions dict and the serialized table corpus across all 17 formats. [Download these files.](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
 
 ```
 data/dataset_all/new_all_questions_dict_wtq_nqt_wikisql.pkl
