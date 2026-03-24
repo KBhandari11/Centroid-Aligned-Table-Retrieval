@@ -1,0 +1,42 @@
+# ── Core ML ───────────────────────────────────────────────────────────────────
+torch>=2.1.0
+transformers>=4.40.0
+
+# SparseEncoder requires >= 3.3.0
+sentence-transformers>=3.3.0
+
+# Multi-device training (Accelerator)
+accelerate>=0.30.0
+
+# ── Data Handling ─────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.26.0
+pyarrow>=15.0.0              # parquet I/O for cached embedding files
+
+# ── Table Serialization ───────────────────────────────────────────────────────
+tabulate>=0.9.0              # df.to_markdown() backend
+lxml>=5.1.0                  # df.to_xml() backend
+pandera[pandas]>=0.18.0      # pandera.pandas — mschema / macschema schema inference
+
+# ── Retrieval Evaluation ──────────────────────────────────────────────────────
+ranx>=0.3.16                 # Qrels, Run, evaluate
+
+# ── Vector Indexing ───────────────────────────────────────────────────────────
+faiss-cpu>=1.8.0             # swap for faiss-gpu on CUDA machines
+
+# ── Statistical Analysis ──────────────────────────────────────────────────────
+scipy>=1.12.0                # Wilcoxon signed-rank tests
+scikit-learn>=1.4.0          # PCA in embedding visualisations
+
+# ── Experiment Utilities ──────────────────────────────────────────────────────
+tqdm>=4.66.0
+pyyaml>=6.0.1
+
+# ── Notebooks / Figures ───────────────────────────────────────────────────────
+jupyter>=1.0.0
+matplotlib>=3.8.0
+seaborn>=0.13.0
+
+# ── Dataset Download ──────────────────────────────────────────────────────────
+datasets>=2.19.0             # WTQ, WikiSQL, NQ-Tables via HuggingFace Hub
+huggingface-hub>=0.23.0
