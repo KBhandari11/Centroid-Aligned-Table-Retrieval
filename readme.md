@@ -133,27 +133,29 @@ Per-representation CSV files land in `./data/retrieval_all/{model_name}_results_
 python -m adapter.train_universal_adapter <model_name> <date> <"subset"|"joint">
 ```
 
+Trained model can be found here: [Trained Model](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
+
 **Joint training on WTQ + WikiSQL + NQ:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-01 joint
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter reasonir 2026-03-01 joint
+CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-10 joint
+CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter reasonir 2026-03-10 joint
 ```
 
 Adapter saved to:
 ```
-/data/Kushal/UniversalRetrieval_data/2026-03-01/centroid_adapter/{model_name}/adapter.pt
+/data/Kushal/UniversalRetrieval_data/2026-03-10/centroid_adapter/{model_name}/adapter.pt
 ```
 
 **Subset training on WTQ + WikiSQL only** (tests cross-dataset transfer to NQ):
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-01 subset
+CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-10 subset
 ```
 
 Adapter saved to:
 ```
-/data/Kushal/UniversalRetrieval_data/2026-03-01/centroid_adapter_subset_dataset/{model_name}/adapter.pt
+/data/Kushal/UniversalRetrieval_data/2026-03-10/centroid_adapter_subset_dataset/{model_name}/adapter.pt
 ```
 
 Training logs and checkpoints write every 200 steps. A `trajectory.jsonl` and `trajectory.pkl` in the adapter directory record per-step loss values for plotting.
@@ -162,15 +164,15 @@ Training logs and checkpoints write every 200 steps. A `trajectory.jsonl` and `t
 
 ## 6. Evaluate the Adapter
 
-Both evaluation scripts take the same three positional arguments as the training script: model name, date, and `"subset"` or other. They resolve the adapter path from those arguments automatically.
+Both evaluation scripts take the same three positional arguments as the training script: model name, date, and `"subset"` or other. They resolve the adapter path from those arguments automatically. Trained model can be found here: [Trained Model](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
 
 **Recall@K evaluation across all serializations:**
 
 ```bash
 # joint adapter
-python -m adapter.test_universal_adapter mpnet 2026-03-01 joint
+python -m adapter.test_universal_adapter mpnet 2026-03-10 joint
 # subset adapter
-python -m adapter.test_universal_adapter mpnet 2026-03-01 subset
+python -m adapter.test_universal_adapter mpnet 2026-03-10 subset
 ```
 
 Results write to:
@@ -183,8 +185,8 @@ Results write to:
 **Per-question rank export with adapter** (Δlog-rank analysis):
 
 ```bash
-python -m adapter.test_rank_universal_adapter mpnet 2026-03-01 joint
-python -m adapter.test_rank_universal_adapter mpnet 2026-03-01 subset
+python -m adapter.test_rank_universal_adapter mpnet 2026-03-10 joint
+python -m adapter.test_rank_universal_adapter mpnet 2026-03-10 subset
 ```
 
 Results write to:
