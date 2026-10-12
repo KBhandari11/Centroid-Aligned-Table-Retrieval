@@ -2,7 +2,7 @@
 
 Code for **"Robust Table Retrieval Under Serialization Shift via Centroid-Aligned Adapters"**.
 
-The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, etc.) shifts table embeddings across retriever families and introduces a lightweight residual bottleneck adapter that transports single-format embeddings toward a centroid target, improving retrieval robustness without retraining the base encoder.
+The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, etc.) shifts table embeddings across retriever families and introduces a lightweight **Hierarchical Centroid-Aligned Adapter** that transports single-format embeddings toward a stable centroid target, improving retrieval robustness without retraining the base encoder.
 
 ---
 
@@ -11,12 +11,12 @@ The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, e
 ```
 .
 ├── adapter/
-│   ├── train_universal_adapter.py        # adapter training entry point
-│   ├── test_universal_adapter.py         # Recall@K evaluation with adapter
+│   ├── train_universal_adapter.py        # HierTableDataset, hier_loss(), train()
+│   ├── test_universal_adapter.py         # Recall@K / Log-Rank Delta evaluation with adapter
 │   └── test_rank_universal_adapter.py    # per-question rank export with adapter
 ├── analysis/
-│   ├── create_embedding_visualization.py # PCA plots of serialization orbits
-│   └── representation_drift_all.py       # cross-format drift statistics
+│   ├── measure_residual_norm.py          # format drift / residual norm statistics
+│   └── visualize_residual_analysis.ipynb # PCA visualization of embedding orbits
 ├── data/
 │   └── dataset_all/                      # populated by setup steps below
 │       ├── new_all_questions_dict_wtq_nqt_wikisql.pkl
@@ -33,16 +33,14 @@ The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, e
 ├── retrieval/
 │   ├── retrieval_all_multiple_dataset.py         # single-format baseline retrieval
 │   ├── retrieval_combination_multiple_dataset.py # centroid combination retrieval
-│   └── retrieval_rank_export.py                  # per-question gold rank export
+│   └── retrieval_rank_export.py                  # per-question gold rank export (no adapter)
 ├── utils/
-│   ├── Adapter.py              # BottleneckResidualAdapter and ResidualCentroidAdapter
-│   ├── cache_embedding.py      # cache_exists / load_cache_mmap utilities
-│   ├── core.py                 # get_data, get_table_corpus, compute_and_cache_*, batched_topk
-│   ├── dataset.py              # CacheMultiViewDatasetGiant, collate_fn
-│   ├── losses.py               # invariance, variance, covariance, identity loss terms
-│   ├── model.py                # get_model factory (MPNet, BGE-M3, ReasonIR, SPLADE, Jina)
-│   ├── table_representation.py # all 17 serialization implementations
-│   └── TrainerConfig.py        # TrainCfg dataclass
+│   ├── model.py              # get_model() factory for all retrievers
+│   ├── Adapter.py            # HierDenseAdapter, HierSparseAdapter (+ legacy adapters)
+│   ├── TrainerConfig.py      # TrainCfg (legacy), HierCfg (current)
+│   ├── dataset.py            # CacheMultiViewDatasetGiant (legacy batch training)
+│   ├── cache_embedding.py    # save/load cache (dense + sparse)
+│   └── core.py               # SPLADE utilities, batched_topk, centroid helpers
 ├── requirements.txt
 └── README.md
 ```
@@ -54,7 +52,7 @@ The project measures how serialization format (CSV, TSV, HTML, Markdown, JSON, e
 Python 3.10 or later is recommended.
 
 ```bash
-git clone https://github.com/KBhandari11/Centroid-Aligned-Table-Retrieval.git
+git clone <repo-url>
 cd Centroid-Aligned-Table-Retrieval
 pip install -r requirements.txt
 ```
@@ -63,14 +61,17 @@ pip install -r requirements.txt
 
 ## 2. Data Setup
 
-The pipeline expects two pre-built pickle files under `data/dataset_all/`. These are derived from WTQ, WikiSQL, and NQ-Tables and contain the questions dict and the serialized table corpus across all 17 formats. [Download these files.](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
+The pipeline expects two pre-built pickle files under `data/dataset_all/`. These are derived from WTQ, WikiSQL, and NQ-Tables and contain the questions dict and the serialized table corpus across all 17 formats.
 
 ```
 data/dataset_all/new_all_questions_dict_wtq_nqt_wikisql.pkl
+   → {dataset_key: {question_id: {"question": str, "gold_table_id": str}}}
+
 data/dataset_all/all_table_transform_table_corpus.pkl
+   → {dataset_key: {table_id: {rep_name: serialized_string}}}
 ```
 
-Place them at those paths before running any retrieval or training script. The table corpus pickle should map dataset keys (`"WTQ"`, `"WIKISQL"`, `"NQ"`) to dicts of `{table_id: {rep_name: serialized_string}}`. The questions pickle should map dataset keys to dicts of `{question_id: {"question": str, "gold_table_id": str}}`.
+Place them at those paths before running any retrieval or training script.
 
 To build these pickles from raw benchmark data, run:
 
@@ -82,117 +83,106 @@ python representations/create_representation.py
 
 ## 3. Build the Embedding Cache
 
-Embeddings are pre-computed once and stored as memory-mapped files via `utils/cache_embedding.py`. Retrieval and training scripts build the cache on demand at the path configured in `utils/core.py` as `CACHE_ROOT`. Set that variable to a directory with sufficient disk space before running.
+Embeddings are pre-computed once and stored as memory-mapped files via `utils/cache_embedding.py`. Set `CACHE_ROOT` in `utils/core.py` to a directory with sufficient disk space.
 
-Retrieval scripts call `compute_and_cache_rep_embeddings` and `compute_and_cache_centroid` internally on cache miss, so no separate cache-build step is required. On the first run for a given model and dataset, expect a significant one-time encoding cost.
+**Cache layout:**
+```
+{CACHE_ROOT}/{model_name}/{dataset}/chunked_{rep_name}.emb.npy      (dense)
+{CACHE_ROOT}/{model_name}/{dataset}/chunked_{rep_name}.doc_ids.json
+{CACHE_ROOT}/{model_name}/{dataset}/chunked_{rep_name}.sparse.npz   (SPLADE)
+```
+
+Retrieval scripts call `compute_and_cache_rep_embeddings` and `compute_and_cache_centroid` internally on cache miss, so no separate cache-build step is required. Alternatively, pre-compute explicitly:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset mpnet
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset bge
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset splade
+# repeat for each model key
+```
 
 ---
 
 ## 4. Retrieval Baselines
 
-All retrieval scripts take the model name as the first positional argument. Results write to `./data/retrieval_all/{model_name}_results/{dataset}/perturbation_results.json`.
+All retrieval scripts take the model name as the first positional argument. Results write to `retrieval_all/{model}_results/{dataset}/perturbation_results.json`.
 
 **Single-format retrieval across all 17 serializations and 5 centroid variants:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset reasonir
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset bge
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset mpnet
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_all_multiple_dataset splade
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset mpnet
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset bge
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset reasonir
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_all_multiple_dataset splade
 ```
 
 **Custom centroid combination** (any subset of the 17 base representations):
 
 ```bash
 # Args: model_name rep1 rep2 [rep3 ...]
-# Valid rep names are listed in REPRESENTATION inside the script.
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_combination_multiple_dataset mpnet csv tsv pipe_serialized space_serialized transpose
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_combination_multiple_dataset splade csv tsv pipe_serialized space_serialized xml latex
+python -m retrieval.retrieval_combination_multiple_dataset mpnet \
+    csv tsv pipe_serialized space_serialized transpose
 ```
 
-Results for each combination are appended into the same `perturbation_results.json` under a key formed by joining the rep names with underscores.
-
-**Per-question gold rank export** (used by the analysis notebooks):
+**Per-question gold rank export** (used by analysis notebooks):
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m retrieval.retrieval_rank_export reasonir
-CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export bge
-CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export mpnet
-CUDA_VISIBLE_DEVICES=1   python -m retrieval.retrieval_rank_export splade
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_rank_export mpnet
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_rank_export bge
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_rank_export reasonir
+CUDA_VISIBLE_DEVICES=0 python -m retrieval.retrieval_rank_export splade
 ```
-
-Per-representation CSV files land in `./data/retrieval_all/{model_name}_results_rank/{dataset}/{rep}_gold_rank_per_question.csv`.
 
 ---
 
 ## 5. Train the Adapter
 
-`train_universal_adapter.py` takes three positional arguments: model name, a date string used to organise output paths, and `"subset"` or any other value to select the training corpus.
+`train_universal_adapter.py` takes three positional arguments: model name, a date string used to organise output paths, and `all` (joint: WTQ + WikiSQL + NQ) or `subset` (WTQ + WikiSQL only, zero-shot NQ at evaluation).
 
 ```
-python -m adapter.train_universal_adapter <model_name> <date> <"subset"|"joint">
+python -m adapter.train_universal_adapter <model_name> <date> <all|subset>
 ```
-
-Trained model can be found here: [Trained Model](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
 
 **Joint training on WTQ + WikiSQL + NQ:**
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-10 joint
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter reasonir 2026-03-10 joint
-```
-
-Adapter saved to:
-```
-/data/Kushal/UniversalRetrieval_data/2026-03-10/centroid_adapter/{model_name}/adapter.pt
+CUDA_VISIBLE_DEVICES=0 python -m adapter.train_universal_adapter mpnet   2026-09-17 all > log/training_mpnet_joint.txt 2>&1
+CUDA_VISIBLE_DEVICES=0 python -m adapter.train_universal_adapter bge     2026-09-17 all > log/training_bge_joint.txt 2>&1
+CUDA_VISIBLE_DEVICES=0 python -m adapter.train_universal_adapter splade  2026-09-17 all > log/training_splade_joint.txt 2>&1
 ```
 
 **Subset training on WTQ + WikiSQL only** (tests cross-dataset transfer to NQ):
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m adapter.train_universal_adapter mpnet 2026-03-10 subset
+CUDA_VISIBLE_DEVICES=0 python -m adapter.train_universal_adapter mpnet 2026-09-12 subset > log/training_mpnet_subset.txt 2>&1
 ```
 
-Adapter saved to:
-```
-/data/Kushal/UniversalRetrieval_data/2026-03-10/centroid_adapter_subset_dataset/{model_name}/adapter.pt
-```
-
-Training logs and checkpoints write every 200 steps. A `trajectory.jsonl` and `trajectory.pkl` in the adapter directory record per-step loss values for plotting.
+Training logs and checkpoints save every 500 steps. A `trajectory.jsonl` and `trajectory.pkl` in the adapter directory record per-step loss values for plotting.
 
 ---
 
 ## 6. Evaluate the Adapter
 
-Both evaluation scripts take the same three positional arguments as the training script: model name, date, and `"subset"` or other. They resolve the adapter path from those arguments automatically. Trained model can be found here: [Trained Model](https://drive.google.com/drive/folders/1zEbt6m--XYjoiEGr8D8t0RjYtC_v02Ku?usp=sharing)
+Both evaluation scripts take the same three positional arguments: model name, date, and `all` or `subset`.
 
-**Recall@K evaluation across all serializations:**
+**Recall@1 / Log-Rank Delta across all serializations:**
 
 ```bash
-# joint adapter
-python -m adapter.test_universal_adapter mpnet 2026-03-10 joint
-# subset adapter
-python -m adapter.test_universal_adapter mpnet 2026-03-10 subset
+python -m adapter.test_universal_adapter mpnet 2026-09-17 all      # joint adapter
+python -m adapter.test_universal_adapter mpnet 2026-09-12 subset   # subset adapter
 ```
 
 Results write to:
 ```
-/data/Kushal/UniversalRetrieval_data/retrieval_all/{model_name}_results/{dataset}/{date}/
-  perturbation_results_with_adapter.json       # joint
-  perturbation_results_with_adapter_subset.json  # subset
+retrieval_all/{model}_results/{dataset}/{date}/perturbation_results_with_adapter.json        # joint
+retrieval_all/{model}_results/{dataset}/{date}/perturbation_results_with_adapter_subset.json # subset
 ```
 
 **Per-question rank export with adapter** (Δlog-rank analysis):
 
 ```bash
-python -m adapter.test_rank_universal_adapter mpnet 2026-03-10 joint
-python -m adapter.test_rank_universal_adapter mpnet 2026-03-10 subset
-```
-
-Results write to:
-```
-/data/Kushal/UniversalRetrieval_data/retrieval_all/{model_name}_results_rank_with_adapter/{date}/
-/data/Kushal/UniversalRetrieval_data/retrieval_all/{model_name}_results_rank_with_adapter_subset/{date}/
+python -m adapter.test_rank_universal_adapter mpnet 2026-09-17 all
+python -m adapter.test_rank_universal_adapter mpnet 2026-09-12 subset
 ```
 
 ---
@@ -200,13 +190,13 @@ Results write to:
 ## 7. Figures and Analysis
 
 ```bash
-python analysis/representation_drift_all.py
-python analysis/create_embedding_visualization.py
+python analysis/measure_residual_norm.py
 ```
 
-Interactive notebooks live in `figure/`:
+Interactive notebooks for PCA visualization and paper figures:
 
 ```bash
+jupyter notebook analysis/visualize_residual_analysis.ipynb
 jupyter notebook figure/
 ```
 
@@ -214,57 +204,83 @@ jupyter notebook figure/
 
 ## Retriever Models
 
-| Key | HuggingFace ID | Type |
-|---|---|---|
-| `mpnet` | `all-mpnet-base-v2` | Dense |
-| `bge` | `BAAI/bge-m3` | Dense (multilingual) |
-| `reasonir` | `reasonir/ReasonIR-8B` | Dense (reasoning-optimised) |
-| `splade` | `naver/splade-v3` | Sparse lexical |
-| `jina` | `jinaai/jina-embeddings-v3` | Dense (multilingual) |
-| `rank1` | `jhu-clsp/rank1-7b` | Dense |
+| Key | HuggingFace ID | Type | Embedding Dim | Precision |
+|---|---|---|---|---|
+| `mpnet` | `sentence-transformers/all-mpnet-base-v2` | Dense | 768 | float32 |
+| `miniLM` | `sentence-transformers/all-MiniLM-L6-v2` | Dense | 384 | float16 |
+| `bge` | `BAAI/bge-m3` | Dense (multilingual) | 1024 | float16 |
+| `jina` | `jinaai/jina-embeddings-v3` | Dense (multilingual) | 1024 | float16 |
+| `mdbr` | `MongoDB/mdbr-leaf-ir` | Dense | 768 | float16 |
+| `reasonir` | `reasonir/ReasonIR-8B` | Dense (reasoning-augmented LLM) | 4096 | float16 |
+| `rank1` | `jhu-clsp/rank1-7b` | Dense (LLM-based) | 4096 | float16 |
+| `qwen0.6B` | `Qwen/Qwen3-Embedding-0.6B` | Dense | 1024 | float16 |
+| `qwen4B` | `Qwen/Qwen3-Embedding-4B` | Dense | 2560 | float16 |
+| `qwen8B` | `Qwen/Qwen3-Embedding-8B` | Dense | 4096 | float16 |
+| `splade` | `naver/splade-v3` | Sparse (lexical) | Vocab (~30K) | float32 |
 
-Models are downloaded automatically from the HuggingFace Hub on first use. `reasonir` and `rank1` load with `torch_dtype=torch.float16` and `device_map="auto"`.
+Dense models produce L2-normalized embeddings; scoring is dot product (equivalent to cosine after normalization). Models are downloaded automatically from the HuggingFace Hub on first use. Large LLM-based encoders (`reasonir`, `rank1`, `qwen4B`, `qwen8B`) load with `torch_dtype=torch.float16` and `device_map="auto"`.
 
 ---
 
 ## Serialization Formats
 
-| Category | Internal key | Formats |
-|---|---|---|
-| Popular | `centroid_popular` | `pipe_serialized`, `token_serialized`, `space_serialized` |
-| Data | `centroid_data` | `csv`, `tsv`, `html`, `markdown`, `latex`, `dict`, `json`, `xml` |
-| Structural | `centroid_structural` | `shuffled_rows`, `shuffled_cols`, `transpose` |
-| Schema | `centroid_schema` | `mschema`, `macschema`, `ddl` |
-| All | `centroid_all` | all 17 above |
+17 formats organized into 4 semantic categories:
 
-See `utils/table_representation.py` for implementation details and Appendix A.3 of the paper for template examples.
+| Category | Centroid Key | Formats |
+|---|---|---|
+| Popular (3) | `centroid_popular` | `pipe_serialized`, `token_serialized`, `space_serialized` |
+| Data (8) | `centroid_data` | `csv`, `tsv`, `html`, `markdown`, `latex`, `dict`, `json`, `xml` |
+| Structural (3) | `centroid_structural` | `shuffled_rows`, `shuffled_cols`, `transpose` |
+| Schema (3) | `centroid_schema` | `mschema`, `macschema`, `ddl` |
+| All 17 | `centroid_all` | all above (primary retrieval target) |
+
+See `representations/create_representation.py` for implementation details.
 
 ---
 
-## Key Hyperparameters
+## Adapter Architecture
 
-These are the defaults set directly in `train_universal_adapter.py` via `TrainCfg`. There are no CLI flags for overriding them; edit the `TrainCfg(...)` call in the script.
+The adapter is a two-stage module trained entirely on frozen embeddings (no gradient flows into the base retriever).
+
+**HierDenseAdapter** (all dense models):
+- **Stage A** — closed-form format offset removal: subtracts a learnable per-format bias `b_fmt` initialized to the empirically estimated mean offset of each format from the centroid
+- **Stage B** — bottleneck residual with FiLM category conditioning: `z = x + Up(Dropout(FiLM_cat(GELU(Down(LN(x))))))`, with `Up` zero-initialized so the adapter starts as an exact identity
+
+**HierSparseAdapter** (SPLADE):
+- Uses a multiplicative log-gate mechanism to preserve SPLADE's non-negative sparse structure
+- Gate initialized to the empirical log ratio of centroid to per-format activations
+
+At inference, if the serialization format is unknown, the adapter uses a soft blend of per-format biases predicted by an auxiliary format classification head.
+
+---
+
+## Key Hyperparameters (HierCfg)
 
 | Parameter | Value |
 |---|---|
-| Training steps | 20 000 |
-| Batch size | 512 |
-| Learning rate | 3 × 10⁻⁴ |
-| Weight decay | 1 × 10⁻⁴ |
-| λ\_inv | 100.0 |
-| λ\_id | 100.0 |
-| λ\_var | 25.0 |
-| λ\_cov | 1.0 |
-| γ\_std | 0.05 |
-| Bottleneck rank (r) | 512 |
+| Training steps | 30,000 |
+| Tables per batch | 96 (all format views of each emitted) |
+| Learning rate | 1 × 10⁻⁴ |
+| Format offset LR multiplier | 0.05 (effective LR = 5 × 10⁻⁶) |
+| Weight decay | 1 × 10⁻³ |
+| Gradient clip (L2) | 5.0 |
+| Bottleneck rank r | 1028 |
 | Dropout | 0.05 |
-| Residual scale (α) | 0.01 |
-| Log / checkpoint every | 200 steps |
+| w_all / w_cat / w_prog / w_sep | 1.0 each |
+| w_bound | 8.0 |
+| w_fmt | 0.1 |
+| Anneal fraction (format-align phase) | 0.4 (steps 1–12,000) |
+| Centroid proximity target δ_all | 0.01 |
+| Category proximity target δ_cat | 0.02 |
+| Displacement bound multiplier ρ | 0.5 |
+| Log / checkpoint every | 200 / 500 steps |
+
+Hyperparameters are set via `HierCfg` in `utils/TrainerConfig.py`. There are no CLI flags; edit the dataclass directly.
 
 ---
 
-## Citation
 
+## Citation
 
 ```
 ```
