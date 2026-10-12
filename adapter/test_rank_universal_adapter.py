@@ -1,100 +1,49 @@
 import os
 import sys
 import gc
-import json
-import pickle
-from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import scipy.sparse
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
-from transformers import AutoModel
-from sentence_transformers import SentenceTransformer, SparseEncoder
+from typing import Optional
 
-from ..utils.cache_embedding import cache_exists, load_cache_mmap
-from ..utils.Adapter import BottleneckResidualAdapter
-
-
-# -----------------------------
-# rep lists
-# -----------------------------
-BASE_REPS = [
-    "pipe_serialized", "token_serialized", "space_serialized",
-    "csv", "tsv", "html", "markdown", "latex", "dict", "json", "xml",
-    "shuffled_rows", "shuffled_cols", "transpose",
-    "mschema", "macschema", "ddl",
-]
-
-CENTROID_REPS = [
-    "centroid_popular", "centroid_data",
-    "centroid_structural", "centroid_schema", "centroid_all"
-]
-
-ALL_REPS = BASE_REPS + CENTROID_REPS
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.cache_embedding import cache_exists_for_model, load_cache_for_model
+from utils.core import (
+    SPLADE_TOPK,
+    _topk_dense_to_sparse,
+    get_data,
+    get_table_corpus,
+    score_top3_chunk_mean,
+    FORMATS_17,
+)
+from utils.model import get_model
+from utils.Adapter import HierDenseAdapter, HierSparseAdapter, FMT2IDX
 
 
 # -----------------------------
-# helpers
+# rep lists (chunked)
 # -----------------------------
-def get_data(filename: str) -> dict:
-    with open(filename, "rb") as f:
-        return pickle.load(f)
+CATEGORY_MAP = {
+    "centroid_popular":    ["pipe_serialized", "token_serialized", "space_serialized"],
+    "centroid_data":       ["csv", "tsv", "html", "markdown", "latex", "dict", "json", "xml"],
+    "centroid_structural": ["shuffled_rows", "shuffled_cols", "transpose"],
+    "centroid_schema":     ["mschema", "macschema", "ddl"],
+}
 
-def get_table_corpus(path: str) -> dict:
-    if os.path.exists(path):
-        with open(path, "rb") as f:
-            return pickle.load(f)
-    return {}
-
-def get_model(accelerator, model_name="reasonir"):
-    if "splade" in model_name:
-        return SparseEncoder("naver/splade-v3")
-
-    if "reasonir" in model_name:
-        model = AutoModel.from_pretrained(
-            "reasonir/ReasonIR-8B",
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            device_map="auto",
-        )
-        model.eval()
-        return model
-
-    if "rank1" in model_name:
-        model = AutoModel.from_pretrained(
-            "jhu-clsp/rank1-7b",
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-            device_map="auto",
-        )
-        model.eval()
-        return model
-
-    if "bge" in model_name:
-        return SentenceTransformer(
-            "BAAI/bge-m3",
-            model_kwargs={"dtype": torch.float16, "device_map": "auto"},
-            device="cuda",
-        )
-
-    if "mpnet" in model_name:
-        return SentenceTransformer("all-mpnet-base-v2", device="cuda")
-
-    if "jina" in model_name:
-        return SentenceTransformer(
-            "jinaai/jina-embeddings-v3",
-            model_kwargs={"dtype": torch.float16, "device_map": "auto"},
-            trust_remote_code=True,
-        )
-
-    if "bm25" in model_name:
-        return None
-
-    raise ValueError(f"Unknown model_name={model_name}")
+CHUNKED_BASE_REPS    = [f"chunked_{f}" for f in FORMATS_17]
+CHUNKED_CENTROID_REPS = (
+    [f"chunked_centroid_{k}" for k in CATEGORY_MAP]
+    + ["chunked_centroid_all"]
+)
+ALL_CHUNKED_REPS = CHUNKED_BASE_REPS + CHUNKED_CENTROID_REPS
 
 
+# -----------------------------
+# Query encoding
+# -----------------------------
 def encode_query(model_name: str, model, question: str) -> np.ndarray:
     if model_name == "reasonir":
         q = model.encode([question], instruction="")
@@ -113,75 +62,69 @@ def encode_query(model_name: str, model, question: str) -> np.ndarray:
     return q.squeeze(0).astype(np.float32, copy=False)
 
 
-def batched_dot_scores(doc_embeddings, q, batch_size=8192):
-    n = doc_embeddings.shape[0]
-    q = np.ascontiguousarray(q, dtype=np.float32)
-    scores = np.empty(n, dtype=np.float32)
-
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        scores[start:end] = (doc_embeddings[start:end] @ q).astype(np.float32, copy=False)
-
-    return scores
-
-
 # -----------------------------
-# Adapter IO + application
+# Adapter IO + application (hierarchical adapters, dot-product space)
 # -----------------------------
-def load_adapter(adapter_path: str, device: str = "cuda") -> Tuple[BottleneckResidualAdapter, int, dict]:
-    ckpt = torch.load(adapter_path, map_location="cpu")
+def load_adapter(adapter_path: str, device: str = "cuda"):
+    ckpt = torch.load(adapter_path, map_location="cpu", weights_only=False)
     D = int(ckpt["D"])
     cfg = ckpt.get("cfg", {})
+    is_sparse = (ckpt.get("model_name") == "splade")
 
-    adapter = BottleneckResidualAdapter(
-        d=D,
-        r=cfg.get("r", None),
-        alpha=cfg.get("alpha", None),
-        dropout=cfg.get("dropout", None),
-        use_bias=cfg.get("use_bias", None),
-    )
+    if is_sparse:
+        adapter = HierSparseAdapter(
+            D, r=cfg.get("r", 256), dropout=cfg.get("dropout", 0.05),
+            k_exp=cfg.get("k_exp", 0), topk=SPLADE_TOPK,
+        )
+    else:
+        adapter = HierDenseAdapter(D, r=cfg.get("r", 256), dropout=cfg.get("dropout", 0.05))
+
     adapter.load_state_dict(ckpt["state_dict"], strict=True)
     adapter.eval().to(device)
-    return adapter, D, ckpt
+    return adapter, D, ckpt, is_sparse
 
 
-@torch.no_grad()
-def adapt_query(
-    adapter: BottleneckResidualAdapter,
-    q: np.ndarray,
-    device="cuda",
-    normalize=True
-) -> np.ndarray:
-    t = torch.from_numpy(np.asarray(q, dtype=np.float32)).to(device)
-    if t.ndim == 1:
-        t = t.unsqueeze(0)
-    z = adapter(t)
-    if normalize:
-        z = F.normalize(z, p=2, dim=-1)
-    z = z.detach().cpu().numpy().astype(np.float32, copy=False)
-    return z[0]
+def _fmt_tensor(perturbation: str, n: int, device: str) -> Optional[torch.Tensor]:
+    """Base reps map to a known format index. Centroid reps use the format head (None).
+    Strips the 'chunked_' prefix before looking up in FMT2IDX."""
+    base = perturbation.removeprefix("chunked_")
+    if base in FMT2IDX:
+        return torch.full((n,), FMT2IDX[base], dtype=torch.long, device=device)
+    return None
 
 
-def build_adapted_doc_memmap(
-    adapter: BottleneckResidualAdapter,
+def build_adapted_docs(
+    adapter,
     doc_embeddings,
-    device="cuda",
-    normalize=True,
-    batch_size=8192,
+    perturbation: str,
+    is_sparse: bool,
+    device: str = "cuda",
+    batch_size: int = 8192,
 ):
+    """
+    Returns raw adapted document embeddings in the same space the adapter was
+    trained in. No normalisation: retrieval is dot product on both base and
+    adapted sides. Dense -> float32 ndarray. Sparse -> CSR with top-K rows.
+    """
     N, D = doc_embeddings.shape
-    adapted = np.zeros((N, D), dtype=np.float32)
+    outs = []
+    adapted = None if is_sparse else np.zeros((N, D), dtype=np.float32)
 
     with torch.no_grad():
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            block = np.asarray(doc_embeddings[start:end], dtype=np.float32)
-            t = torch.from_numpy(block).to(device)
-            z = adapter(t)
-            if normalize:
-                z = F.normalize(z, p=2, dim=-1)
-            adapted[start:end] = z.detach().cpu().numpy().astype(np.float32, copy=False)
+            block = doc_embeddings[start:end]
+            block = block.toarray() if scipy.sparse.issparse(block) else np.asarray(block)
+            t = torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32)).to(device)
+            fmt = _fmt_tensor(perturbation, t.shape[0], device)
+            z = adapter(t, fmt)[0].detach().cpu().numpy().astype(np.float32, copy=False)
+            if is_sparse:
+                outs.append(_topk_dense_to_sparse(z, SPLADE_TOPK))
+            else:
+                adapted[start:end] = z
 
+    if is_sparse:
+        return scipy.sparse.vstack(outs, format="csr")
     return adapted
 
 
@@ -202,10 +145,15 @@ def export_gold_ranks_with_adapter(
 ):
     adapter = None
     adapter_dim = None
+    is_sparse = (model_name == "splade")
 
     if adapter_path is not None and model_name != "bm25":
-        adapter, adapter_dim, _ = load_adapter(adapter_path, device="cuda")
-        print(f"[adapter] loaded {adapter_path} (D={adapter_dim})", flush=True)
+        adapter, adapter_dim, ckpt, is_sparse_ckpt = load_adapter(adapter_path, device="cuda")
+        if ckpt.get("scoring", "dot_product") != "dot_product":
+            raise ValueError("Adapter checkpoint was not trained for dot-product scoring.")
+        if is_sparse_ckpt != is_sparse:
+            raise ValueError("Adapter sparsity does not match model_name.")
+        print(f"[adapter] loaded {adapter_path} (D={adapter_dim}, sparse={is_sparse})", flush=True)
 
     for dataset in dataset_list:
         print(f"\n[Dataset] {dataset}", flush=True)
@@ -219,87 +167,91 @@ def export_gold_ranks_with_adapter(
         dataset_dir = os.path.join(output_root, dataset)
         os.makedirs(dataset_dir, exist_ok=True)
 
-        for perturbation in ALL_REPS:
-            print(f"  [Rep] {perturbation}", flush=True)
+        for rep_key in ALL_CHUNKED_REPS:
+            rep_csv = os.path.join(dataset_dir, f"{rep_key}_gold_rank_per_question.csv")
+            if os.path.exists(rep_csv):
+                print(f"  [Rep] {rep_key}: already scored, skipping", flush=True)
+                continue
+
+            print(f"  [Rep] {rep_key}", flush=True)
 
             if model_name == "bm25":
                 raise NotImplementedError("bm25 path is not implemented for rank export with adapter.")
 
-            if not cache_exists(cache_root, model_name, dataset, perturbation):
-                print(f"    skipped (no cache): {perturbation}", flush=True)
+            if not cache_exists_for_model(cache_root, model_name, dataset, rep_key):
+                print(f"    skipped (no cache): {rep_key}", flush=True)
                 continue
 
-            doc_ids, doc_embeddings = load_cache_mmap(cache_root, model_name, dataset, perturbation)
+            doc_ids, doc_embeddings = load_cache_for_model(cache_root, model_name, dataset, rep_key)
 
             if len(doc_ids) == 0:
-                print(f"    skipped (empty doc list): {perturbation}", flush=True)
+                print(f"    skipped (empty doc list): {rep_key}", flush=True)
                 continue
 
             if adapter is not None:
                 if doc_embeddings.shape[1] != adapter_dim:
                     raise ValueError(
-                        f"Adapter dim {adapter_dim} != doc dim {doc_embeddings.shape[1]} for {perturbation}"
+                        f"Adapter dim {adapter_dim} != doc dim {doc_embeddings.shape[1]} for {rep_key}"
                     )
-
-                doc_embeddings = build_adapted_doc_memmap(
+                doc_embeddings = build_adapted_docs(
                     adapter=adapter,
                     doc_embeddings=doc_embeddings,
+                    perturbation=rep_key,
+                    is_sparse=is_sparse,
                     device="cuda",
-                    normalize=True,
                     batch_size=8192,
                 )
-
-            doc_index = {str(d): i for i, d in enumerate(doc_ids)}
 
             rep_rows = []
             for qid, qdata in questions_dict.items():
                 question = str(qdata["question"])
                 gold_table_id = str(qdata["gold_table_id"])
 
-                if gold_table_id not in doc_index:
-                    continue
-
                 q = encode_query(model_name, model, question)
 
-                #if adapter is not None and adapt_queries:
-                #    q = adapt_query(adapter, q, device="cuda", normalize=True)
+                # score_top3_chunk_mean aggregates chunk scores per table
+                ranked = score_top3_chunk_mean(
+                    doc_ids, doc_embeddings, q, k=len(doc_ids)
+                )
+                # ranked = [(table_id, primary_score, max_score), ...]
 
-                scores = batched_dot_scores(doc_embeddings, q, batch_size=8192)
-                gold_idx = doc_index[gold_table_id]
-                gold_score = float(scores[gold_idx])
+                primary_scores = {r[0]: r[1] for r in ranked}
+                max_scores     = {r[0]: r[2] for r in ranked}
 
-                rank = int(np.sum(scores > gold_score) + 1)
+                if gold_table_id not in primary_scores:
+                    continue
+
+                gold_primary = primary_scores[gold_table_id]
+                gold_max     = max_scores[gold_table_id]
+
+                rank = int(sum(1 for r in ranked if r[1] > gold_primary) + 1)
 
                 rep_rows.append({
-                    "model": model_name,
-                    "dataset": dataset,
-                    "perturbation": perturbation,
-                    "question_id": str(qid),
+                    "model":         model_name,
+                    "dataset":       dataset,
+                    "format":        rep_key,
+                    "question_id":   str(qid),
                     "gold_table_id": gold_table_id,
-                    "rank": rank,
-                    "gold_score": gold_score,
-                    "num_docs": len(doc_ids),
-                    "hit@1": int(rank <= 1),
-                    "hit@5": int(rank <= 5),
-                    "hit@10": int(rank <= 10),
-                    "hit@50": int(rank <= 50),
+                    "rank":          rank,
+                    "gold_score_top3_mean": gold_primary,
+                    "gold_score_max":       gold_max,
+                    "num_tables":    len(ranked),
+                    "hit@1":   int(rank <= 1),
+                    "hit@5":   int(rank <= 5),
+                    "hit@10":  int(rank <= 10),
+                    "hit@50":  int(rank <= 50),
                     "hit@100": int(rank <= 100),
                 })
-
-            if len(rep_rows) == 0:
-                print(f"    skipped (no usable questions): {perturbation}", flush=True)
-                doc_embeddings = None
-                doc_ids = None
-                gc.collect()
-                continue
-
-            rep_df = pd.DataFrame(rep_rows)
 
             doc_embeddings = None
             doc_ids = None
             gc.collect()
 
-            rep_csv = os.path.join(dataset_dir, f"{perturbation}_gold_rank_per_question.csv")
+            if not rep_rows:
+                print(f"    skipped (no usable questions): {rep_key}", flush=True)
+                continue
+
+            rep_df = pd.DataFrame(rep_rows)
             rep_df.to_csv(rep_csv, index=False)
             print(f"    saved: {rep_csv}", flush=True)
 
@@ -307,16 +259,13 @@ def export_gold_ranks_with_adapter(
 
 
 if __name__ == "__main__":
-    # --------------------------------------------------
-    # Args
-    # --------------------------------------------------
     model_name = sys.argv[1]         # reasonir / rank1 / bge / mpnet / jina / splade
     model_train_date = sys.argv[2]   # e.g. 2026-03-01
     subset = sys.argv[3]             # "subset" or anything else
 
     accelerator = Accelerator()
 
-    dataset_list = ["WTQ", "WIKISQL", "NQ"]
+    dataset_list = ["WTQ", "WIKISQL", "NQ"]# if subset == "subset" else ["WTQ", "WIKISQL", "NQ"]
     cache_root = "/data/Kushal/UniversalRetrieval_data/emb_cache"
 
     questions_path = "/data/Kushal/UniversalRetrieval_data/dataset_all/new_all_questions_dict_wtq_nqt_wikisql.pkl"
@@ -349,5 +298,17 @@ if __name__ == "__main__":
         cache_root=cache_root,
         output_root=output_root,
         adapter_path=adapter_path,
-        adapt_queries=False,  # keep aligned with current test_universal_adapter.py
+        adapt_queries=False,
     )
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter splade 2026-09-12 subset > ./log/test_splade_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter bge 2026-09-12 subset > ./log/test_bge_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter mdbr 2026-09-12 subset > ./log/test_mdbr_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter miniLM 2026-09-12 subset > ./log/test_miniLM_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter mpnet 2026-09-12 subset > ./log/test_mpnet_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter qwen0.6B 2026-09-12 subset > ./log/test_qwen0.6B_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter reasonir 2026-09-12 subset > ./log/test_reasonir_subset_rank_chunked.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter qwen4B 2026-09-12 subset > ./log/test_qwen4B_subset_rank_chunked.txt 2>&1
+
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter splade 2026-09-17 all > ./log/test_splade_rank_chunked_new.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter bge 2026-09-17 all > ./log/test_bge_rank_chunked_new.txt 2>&1
+#CUDA_VISIBLE_DEVICES=1 python -m adapter.test_rank_universal_adapter miniLM 2026-09-17 all > ./log/test_miniLM_rank_chunked_new.txt 2>&1

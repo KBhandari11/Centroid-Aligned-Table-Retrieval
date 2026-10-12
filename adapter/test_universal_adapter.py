@@ -4,12 +4,11 @@ import gc
 import json
 import pickle
 import heapq
-import re
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
+import scipy.sparse
 import torch
-import torch.nn.functional as F
 from accelerate import Accelerator
 from ranx import evaluate, Qrels, Run
 
@@ -17,17 +16,12 @@ from transformers import AutoModel
 from sentence_transformers import SentenceTransformer, SparseEncoder
 
 from ..utils.cache_embedding import cache_exists, load_cache_mmap
-from ..utils.Adapter import ResidualCentroidAdapter
-from ..utils.Adapter import BottleneckResidualAdapter
-
-# (not strictly needed for eval, but imported per your request)
-from ..utils.losses import invariance_to_centroid_loss, variance_loss, covariance_loss, identity_preservation_loss
-from ..utils.dataset import CacheMultiViewDatasetGiant, collate_fn
-from ..utils.TrainerConfig import TrainCfg
+from ..utils.core import SPLADE_TOPK, _topk_dense_to_sparse
+from ..utils.Adapter import HierDenseAdapter, HierSparseAdapter, FMT2IDX
 
 
 # -----------------------------
-# your rep list
+# rep list
 # -----------------------------
 BASE_REPS = [
     'pipe_serialized', 'token_serialized', 'space_serialized',
@@ -39,7 +33,7 @@ SECOND_LEVEL = BASE_REPS + CENTROID_REPS
 
 
 # -----------------------------
-# helpers copied from your pipeline
+# helpers (unchanged)
 # -----------------------------
 def get_data(filename: str) -> dict:
     with open(filename, "rb") as f:
@@ -90,23 +84,29 @@ def get_model(accelerator, model_name="reasonir"):
         return None
     raise ValueError(f"Unknown model_name={model_name}")
 
-def batched_topk(doc_embeddings, q, k=100, batch_size=8192):
-    n = doc_embeddings.shape[0]
-    q = np.ascontiguousarray(q, dtype=np.float32)
-    heap = []  # min-heap of (score, idx)
 
+def batched_topk(doc_embeddings, q, k=100, batch_size=8192):
+    """Top-k by plain dot product. Dense (N, D) arrays / memmaps or CSR matrices."""
+    q = np.ascontiguousarray(q, dtype=np.float32)
+
+    if scipy.sparse.issparse(doc_embeddings):
+        scores = np.asarray(doc_embeddings @ q, dtype=np.float32).ravel()
+        k = min(k, scores.shape[0])
+        top_idx = np.argpartition(-scores, k - 1)[:k]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+        return top_idx.astype(np.int64), scores[top_idx]
+
+    n = doc_embeddings.shape[0]
+    heap = []  # min-heap of (score, idx)
     for start in range(0, n, batch_size):
         end = min(start + batch_size, n)
         block_scores = (doc_embeddings[start:end] @ q).astype(np.float32, copy=False)
-
         for local_i, s in enumerate(block_scores):
             gi = start + local_i
             if len(heap) < k:
                 heapq.heappush(heap, (float(s), gi))
-            else:
-                if s > heap[0][0]:
-                    heapq.heapreplace(heap, (float(s), gi))
-
+            elif s > heap[0][0]:
+                heapq.heapreplace(heap, (float(s), gi))
     heap.sort(key=lambda x: x[0], reverse=True)
     top_scores = np.array([x[0] for x in heap], dtype=np.float32)
     top_idx = np.array([x[1] for x in heap], dtype=np.int64)
@@ -114,60 +114,60 @@ def batched_topk(doc_embeddings, q, k=100, batch_size=8192):
 
 
 # -----------------------------
-# Adapter IO + application
+# Adapter IO + application (hierarchical adapters, dot-product space)
 # -----------------------------
-def load_adapter(adapter_path: str, device: str = "cuda") -> Tuple[BottleneckResidualAdapter, int, dict]:
+def load_adapter(adapter_path: str, device: str = "cuda"):
     ckpt = torch.load(adapter_path, map_location="cpu")
     D = int(ckpt["D"])
     cfg = ckpt.get("cfg", {})
-    '''adapter = BottleneckResidualAdapter(
-        d=D,
-        hidden_mult=cfg.get("hidden_mult", 4),
-        alpha=cfg.get("alpha", 0.1),
-        dropout=cfg.get("dropout", 0.0),
-    )'''
-    adapter = BottleneckResidualAdapter(
-        d=D,
-        r=cfg.get("r", None),
-        alpha=cfg.get("alpha", None),
-        dropout=cfg.get("dropout", None),
-        use_bias=cfg.get("use_bias", None)
-    ) 
+    is_sparse = (ckpt.get("model_name") == "splade")
+
+    if is_sparse:
+        adapter = HierSparseAdapter(
+            D, r=cfg.get("r", 256), dropout=cfg.get("dropout", 0.05),
+            k_exp=cfg.get("k_exp", 0), topk=SPLADE_TOPK,
+        )
+    else:
+        adapter = HierDenseAdapter(D, r=cfg.get("r", 256), dropout=cfg.get("dropout", 0.05))
+
     adapter.load_state_dict(ckpt["state_dict"], strict=True)
     adapter.eval().to(device)
-    return adapter, D, ckpt
+    return adapter, D, ckpt, is_sparse
 
-@torch.no_grad()
-def adapt_query(adapter: BottleneckResidualAdapter, q: np.ndarray, device="cuda", normalize=True) -> np.ndarray:
-    t = torch.from_numpy(np.asarray(q, dtype=np.float32)).to(device)
-    if t.ndim == 1:
-        t = t.unsqueeze(0)
-    z = adapter(t)
-    if normalize:
-        z = F.normalize(z, p=2, dim=-1)
-    z = z.detach().cpu().numpy().astype(np.float32, copy=False)
-    return z[0]
 
-def build_adapted_doc_memmap(
-    adapter: BottleneckResidualAdapter,
-    doc_embeddings,
-    device="cuda",
-    normalize=True,
-    batch_size=8192,
-):
+def _fmt_tensor(rep_name: str, n: int, device: str) -> Optional[torch.Tensor]:
+    """Base reps map to a known format index. Centroid reps use the format head (None)."""
+    if rep_name in FMT2IDX:
+        return torch.full((n,), FMT2IDX[rep_name], dtype=torch.long, device=device)
+    return None
 
+
+def build_adapted_docs(adapter, doc_embeddings, rep_name: str, is_sparse: bool,
+                       device: str = "cuda", batch_size: int = 8192):
+    """
+    Raw adapted document embeddings in the space the adapter was trained in.
+    No normalisation: scoring is dot product on both base and adapted sides.
+    Dense -> float32 ndarray. Sparse -> CSR with top-K rows.
+    """
     N, D = doc_embeddings.shape
-    adapted = np.zeros( shape=(N, D), dtype=np.float32)
+    outs = []
+    adapted = None if is_sparse else np.zeros((N, D), dtype=np.float32)
 
     with torch.no_grad():
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            block = np.asarray(doc_embeddings[start:end], dtype=np.float32)
-            t = torch.from_numpy(block).to(device)
-            z = adapter(t)
-            if normalize:
-                z = F.normalize(z, p=2, dim=-1)
-            adapted[start:end] = z.detach().cpu().numpy().astype(np.float32, copy=False)
+            block = doc_embeddings[start:end]
+            block = block.toarray() if scipy.sparse.issparse(block) else np.asarray(block)
+            t = torch.from_numpy(np.ascontiguousarray(block, dtype=np.float32)).to(device)
+            fmt = _fmt_tensor(rep_name, t.shape[0], device)
+            z = adapter(t, fmt)[0].detach().cpu().numpy().astype(np.float32, copy=False)
+            if is_sparse:
+                outs.append(_topk_dense_to_sparse(z, SPLADE_TOPK))
+            else:
+                adapted[start:end] = z
+
+    if is_sparse:
+        return scipy.sparse.vstack(outs, format="csr")
     return adapted
 
 
@@ -199,18 +199,23 @@ def retrieval_with_adapter(
     all_table_corpus: dict,
     accelerator,
     adapter_path: Optional[str],
-    model_train_date: str, 
+    model_train_date: str,
     result_save_file: str
 ):
-    dataset_list = ["WTQ", "WIKISQL", "NQ"]  # match your current setting
+    dataset_list = ["WTQ", "WIKISQL", "NQ"]
     cache_root = "/data/Kushal/UniversalRetrieval_data/emb_cache"
 
     adapter = None
     adapter_dim = None
+    is_sparse = (model_name == "splade")
 
     if adapter_path is not None and model_name != "bm25":
-        adapter, adapter_dim, _ = load_adapter(adapter_path, device="cuda")
-        print(f"[adapter] loaded {adapter_path} (D={adapter_dim})", flush=True, file=sys.stderr)
+        adapter, adapter_dim, ckpt, is_sparse_ckpt = load_adapter(adapter_path, device="cuda")
+        if ckpt.get("scoring", "dot_product") != "dot_product":
+            raise ValueError("Adapter checkpoint was not trained for dot-product scoring.")
+        if is_sparse_ckpt != is_sparse:
+            raise ValueError("Adapter sparsity does not match model_name.")
+        print(f"[adapter] loaded {adapter_path} (D={adapter_dim}, sparse={is_sparse})", flush=True, file=sys.stderr)
 
     for dataset in dataset_list:
         all_results = {}
@@ -222,37 +227,36 @@ def retrieval_with_adapter(
             accelerator.wait_for_everyone()
             continue
 
-        # Evaluate each rep / centroid cache
         for rep_name in SECOND_LEVEL:
             print("\t perturbation", rep_name, flush=True, file=sys.stderr)
 
             if model_name == "bm25":
                 raise NotImplementedError("bm25 path omitted here; your original code can be reused.")
-            else:
-                if not cache_exists(cache_root, model_name, dataset, rep_name):
-                    print(f"Skipped:{rep_name} (no cache)", flush=True)
-                    continue
 
-                doc_ids, doc_embeddings = load_cache_mmap(cache_root, model_name, dataset, rep_name)
-                if len(doc_ids) == 0:
-                    print(f"Skipped:{rep_name} (no docs)", flush=True)
-                    continue
+            if not cache_exists(cache_root, model_name, dataset, rep_name):
+                print(f"Skipped:{rep_name} (no cache)", flush=True)
+                continue
 
-                if adapter is not None:
-                    if doc_embeddings.shape[1] != adapter_dim:
-                        raise ValueError(
-                            f"Adapter dim {adapter_dim} != doc dim {doc_embeddings.shape[1]} for {rep_name}"
-                        )
+            doc_ids, doc_embeddings = load_cache_mmap(cache_root, model_name, dataset, rep_name)
+            if len(doc_ids) == 0:
+                print(f"Skipped:{rep_name} (no docs)", flush=True)
+                continue
 
-                    doc_embeddings = build_adapted_doc_memmap(
-                        adapter=adapter,
-                        doc_embeddings=doc_embeddings,
-                        device="cuda",
-                        normalize=True,
-                        batch_size=8192,
+            if adapter is not None:
+                if doc_embeddings.shape[1] != adapter_dim:
+                    raise ValueError(
+                        f"Adapter dim {adapter_dim} != doc dim {doc_embeddings.shape[1]} for {rep_name}"
                     )
+                doc_embeddings = build_adapted_docs(
+                    adapter=adapter,
+                    doc_embeddings=doc_embeddings,
+                    rep_name=rep_name,
+                    is_sparse=is_sparse,
+                    device="cuda",
+                    batch_size=8192,
+                )
 
-                doc_id_set = set(doc_ids)
+            doc_id_set = set(doc_ids)
 
             qrels_dict = {}
             runs_dict = {}
@@ -267,9 +271,6 @@ def retrieval_with_adapter(
                 num_questions_processed += 1
 
                 q = encode_query(model_name, model, question)
-
-                #if adapter is not None:
-                #    q = adapt_query(adapter, q, device="cuda", normalize=True)
 
                 K = 100
                 top_idx, top_scores = batched_topk(doc_embeddings, q, k=K, batch_size=8192)
@@ -320,37 +321,33 @@ def retrieval_with_adapter(
             doc_id_set = None
             gc.collect()
 
-        # Save results
         save_dir = f"/data/Kushal/UniversalRetrieval_data/retrieval_all/{model_name}_results/{dataset}/{model_train_date}/"
         os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, result_save_file) #perturbation_results_with_adapter_subset if subset 
+        save_path = os.path.join(save_dir, result_save_file)
         with open(save_path, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"\nSaved results to: {save_path}\n")
 
-        table_corpus = None
         gc.collect()
 
 
 if __name__ == "__main__":
     model_name = sys.argv[1]          # e.g., reasonir / bge / mpnet / jina / splade
-    model_train_date = sys.argv[2]  # 2026-03-01
-    subset  = sys.argv[3]
+    model_train_date = sys.argv[2]    # 2026-03-01
+    subset = sys.argv[3]
 
     accelerator = Accelerator()
     model = get_model(accelerator, model_name=model_name)
-    # if subset: centroid_adapter_subset_dataset 
-    if subset == "subset":
-        adapter_path = f"/data/Kushal/UniversalRetrieval_data/{model_train_date}/centroid_adapter_subset_dataset/{model_name}/adapter.pt" 
-        result_save_file  =  "perturbation_results_with_adapter_subset.json" 
-    else:
-        adapter_path = f"/data/Kushal/UniversalRetrieval_data/{model_train_date}/centroid_adapter/{model_name}/adapter.pt" 
-        result_save_file  = "perturbation_results_with_adapter.json" 
 
-       
+    if subset == "subset":
+        adapter_path = f"/data/Kushal/UniversalRetrieval_data/{model_train_date}/centroid_adapter_subset_dataset/{model_name}/adapter.pt"
+        result_save_file = "perturbation_results_with_adapter_subset.json"
+    else:
+        adapter_path = f"/data/Kushal/UniversalRetrieval_data/{model_train_date}/centroid_adapter/{model_name}/adapter.pt"
+        result_save_file = "perturbation_results_with_adapter.json"
 
     all_questions_dict = get_data('/data/Kushal/UniversalRetrieval_data/dataset_all/new_all_questions_dict_wtq_nqt_wikisql.pkl')
     table_corpus = get_table_corpus("/data/Kushal/UniversalRetrieval_data/dataset_all/all_table_transform_table_corpus.pkl")
 
-
-    retrieval_with_adapter(model_name, model, all_questions_dict, table_corpus, accelerator, adapter_path, model_train_date, result_save_file)
+    retrieval_with_adapter(model_name, model, all_questions_dict, table_corpus, accelerator,
+                           adapter_path, model_train_date, result_save_file)

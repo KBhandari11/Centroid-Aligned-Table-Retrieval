@@ -23,8 +23,20 @@ def get_model(accelerator,model_name="reasonir"):
         model.eval()
     elif "bge" in model_name:
         model = SentenceTransformer("BAAI/bge-m3", model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda",)
+    elif "miniLM" in model_name:
+        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda",)
+    elif "mdbr" in model_name:
+        model = SentenceTransformer('MongoDB/mdbr-leaf-ir', model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda",)
     elif "mpnet" in model_name:
         model = SentenceTransformer("all-mpnet-base-v2",device="cuda")
+    elif "qwen0.6B" in model_name:
+        model = SentenceTransformer("Qwen/Qwen3-Embedding-0.6B", model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda")
+    elif "qwen4B" in model_name:
+        model = SentenceTransformer("Qwen/Qwen3-Embedding-4B", model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda")
+    elif "qwen8B" in model_name:
+        model = SentenceTransformer("Qwen/Qwen3-Embedding-8B", model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda")
+    elif "miniLM" in model_name:
+        model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2', model_kwargs={"dtype": torch.float16,'device_map': "auto"},device="cuda",)
     elif "jina" in model_name:
         model = SentenceTransformer("jinaai/jina-embeddings-v3", model_kwargs={"dtype": torch.float16,'device_map': "auto"}, trust_remote_code=True)
     elif "bm25" in model_name:
@@ -55,12 +67,17 @@ def encode_texts_in_batches(model_name,model, texts, instruction="", batch_size=
         with torch.inference_mode():
             if model_name == "reasonir":
                 emb = model.encode(batch, instruction=instruction)
-            elif model_name == "bge" or model_name =="mpnet":
+            elif model_name == "bge" or model_name == "mpnet":
                 emb = model.encode(batch)
             elif model_name == "jina":
                 emb = model.encode(batch, task="retrieval.passage", prompt_name="retrieval.passage")
             elif model_name == "splade":
-                emb = model.encode_document(batch)
+                # Keep sparse: top-K sparsify and return scipy CSR per batch
+                from utils.core import _splade_encode_to_sparse
+                all_embs.append(_splade_encode_to_sparse(model, batch))
+                torch.cuda.empty_cache()
+                continue
+
         # Convert to torch tensor if needed
         if isinstance(emb, np.ndarray):
             emb = torch.from_numpy(emb)
@@ -70,12 +87,11 @@ def encode_texts_in_batches(model_name,model, texts, instruction="", batch_size=
         # Clean NaN / Inf
         emb = torch.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
-        #print("\t\t",start, emb.shape, flush=True)
-        # Move to CPU and store
         all_embs.append(emb.cpu())
-
         torch.cuda.empty_cache()
-        #if accelerator is not None:
-        #    accelerator.wait_for_everyone()  # all ranks sync here
+
+    if model_name == "splade":
+        import scipy.sparse
+        return scipy.sparse.vstack(all_embs, format="csr")
     # [N, D]
     return torch.cat(all_embs, dim=0)

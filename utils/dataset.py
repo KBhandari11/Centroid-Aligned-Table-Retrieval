@@ -58,7 +58,16 @@ class CacheMultiViewDatasetGiant(Dataset):
         embs = []
         for r in reps:
             row = rep_to_row[r][tid]
-            e = np.asarray(rep_to_emb[r][row], dtype=np.float32)
+            e_mat = rep_to_emb[r]
+            try:
+                import scipy.sparse
+                is_sparse = scipy.sparse.issparse(e_mat)
+            except ImportError:
+                is_sparse = False
+            if is_sparse:
+                e = np.asarray(e_mat[row].toarray(), dtype=np.float32).ravel()
+            else:
+                e = np.asarray(e_mat[row], dtype=np.float32)
             embs.append(torch.tensor(e, dtype=torch.float32))
 
         embs = torch.stack(embs, dim=0)  # (num_views_i, D)

@@ -1,1 +1,6 @@
 __pycache__/
+log/
+paper/
+EXPERIMENT_SETUP.md
+data/ 
+extract_recall_at_1.py
